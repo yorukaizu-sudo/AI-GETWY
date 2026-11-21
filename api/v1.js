@@ -220,6 +220,7 @@ async function chat(req, res, key, st) {
   let attempts = 0, healTries = 0;
   const fixes = {};
   const retried = {};
+  const tried = new Set(); // akun (provider:key) yang benar-benar sudah dicoba
   const fixOf = (pid) => fixes[pid] || (fixes[pid] = { strip: new Set(), caps: {}, rename: {} });
   const cd = (id, sec) => C.redis(['SET', 'cd:' + id, '1', 'EX', sec]).catch(() => {});
 
@@ -244,7 +245,7 @@ async function chat(req, res, key, st) {
     for (let ki = 0; ki < keys.length; ki++) {
       const pk = keys[ki];
       if (attempts >= MAX_ATTEMPTS || Date.now() - t0 > BUDGET_MS) break outer;
-      attempts++;
+      attempts++; tried.add(prov.id + ':' + pk.id);
       const left = BUDGET_MS - (Date.now() - t0);
       const ms = Math.max(5000, Math.min(picked.has(m.id) ? PICKED_MS : ATTEMPT_MS, left));
 
@@ -391,12 +392,12 @@ async function chat(req, res, key, st) {
   const bad = fails.filter((f) => f.status);
   if (mode === 'select' && !fallback) {
     const all4 = bad.length > 0 && bad.every((f) => f.status === 400 || f.status === 422);
-    return C.sendErr(res, all4 ? 400 : 502, `Model "${requested}" gagal (mode select: tidak pindah ke model lain). ` + (explain(fails) || 'tidak ada respons') + ' — Pilih "auto" atau nyalakan fallback di dashboard → Model Atlas.', { attempts: fails.slice(-8) });
+    return C.sendErr(res, all4 ? 400 : 502, `Model "${requested}" gagal (mode select: tidak pindah ke model lain). ` + (explain(fails) || 'tidak ada respons') + ` [${tried.size} akun/key sudah dicoba]` + ' — Pilih "auto" atau nyalakan fallback di dashboard → Model Atlas.', { attempts: fails.slice(-8) });
   }
   if (bad.length && bad.every((f) => f.status === 400 || f.status === 422)) {
     return C.sendErr(res, 400, 'Permintaan ditolak provider: ' + explain(bad), { attempts: fails.slice(-8) });
   }
-  return C.sendErr(res, 502, 'Semua model & API key aktif sedang gagal. Coba lagi sebentar atau tambah key/provider di dashboard. Detail: ' + (explain(fails) || 'tidak ada akun yang bisa dipakai'), { attempts: fails.slice(-8) });
+  return C.sendErr(res, 502, 'Semua model & API key aktif sedang gagal. Coba lagi sebentar atau tambah key/provider di dashboard. Detail: [' + tried.size + ' akun/key sudah dicoba] ' + (explain(fails) || 'tidak ada akun yang bisa dipakai'), { attempts: fails.slice(-8) });
 }
 
 module.exports = async (req, res) => {
