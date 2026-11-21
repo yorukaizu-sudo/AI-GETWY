@@ -65,13 +65,25 @@ async function callUpstream(prov, provKey, body, model) {
   } finally { clearTimeout(t); }
 }
 
-async function chat(req, res, key) {
+async function chat(req, res, key, st) {
   const t0 = Date.now();
   const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
   if (!Array.isArray(body.messages)) return C.sendErr(res, 400, 'messages wajib berupa array');
   const requested = body.model || 'auto';
   const stream = !!body.stream;
   const reqChars = JSON.stringify(body.messages).length;
+
+  /* Batas keras kuota: sebelumnya kuota hanya dicek SEBELUM request, jadi satu request besar
+     bisa melompati limit (mis. limit 10.000 -> terpakai 49.998). Sekarang request yang tidak
+     muat di sisa kuota ditolak, dan panjang jawaban dipotong sesuai sisa kuota. */
+  if (key.limit) {
+    const left = key.limit - ((st && st.tok) || 0);
+    const promptTok = C.est(reqChars);
+    if (promptTok >= left) return C.sendErr(res, 429, `Sisa kuota ${Math.max(0, left)} token tidak cukup untuk request ini (perkiraan prompt ${promptTok} token).`);
+    const cap = left - promptTok;
+    body.max_tokens = Math.min(Number(body.max_tokens) || cap, cap);
+    if (body.max_completion_tokens) body.max_completion_tokens = Math.min(Number(body.max_completion_tokens) || cap, cap);
+  }
 
   const [providers, models] = await Promise.all([C.loadProviders(), C.loadModels()]);
   const cands = await buildCandidates(requested, providers, models);
@@ -230,7 +242,7 @@ module.exports = async (req, res) => {
           .map((m) => ({ id: m.id, object: 'model', owned_by: m.provider, x_healthy: !(health[m.id] && health[m.id].ok === false) })));
       return res.status(200).json({ object: 'list', data });
     }
-    if ((p === 'chat/completions' || p === 'completions') && req.method === 'POST') return await chat(req, res, key);
+    if ((p === 'chat/completions' || p === 'completions') && req.method === 'POST') return await chat(req, res, key, st);
     return C.sendErr(res, 404, 'Endpoint tidak ditemukan: /' + p);
   } catch (e) {
     if (!res.headersSent) return C.sendErr(res, 500, String(e.message || e));
