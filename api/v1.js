@@ -131,26 +131,35 @@ async function buildCandidates(requested, providers, models, hasTools, fallback,
   const usable = (m) => provOn(m) && C.usableKeys(providers[m.provider]).length > 0;
   // model pilihan: akun yang sedang cooldown tetap boleh dicoba (user memilih eksplisit, jangan diam-diam dilewati)
   const reachable = (m) => provOn(m) && (providers[m.provider].keys || []).some((k) => k.key && ['active', 'cooldown'].includes(C.keyStatus(k)));
-  const autoList = async (exclude) => {
+  let stickyId = null;
+  const autoList = async (exclude, useSticky) => {
     const list = models.filter((m) => usable(m) && !exclude.has(m.id)).sort((a, b) => (b.score || 0) - (a.score || 0));
     if (!list.length) return list;
-    let cd = [], health = {}, nt = [], ml = [];
+    let cd = [], health = {}, nt = [], ml = [], lastok = null, pcdv = [];
+    const pids = [...new Set(list.map((m) => m.provider))];
     try {
-      [cd, health, nt, ml] = await Promise.all([
+      [cd, health, nt, ml, lastok, pcdv] = await Promise.all([
         C.redis(['MGET', ...list.map((m) => 'cd:' + m.id)]),
         C.getHealth(),
         hasTools ? C.redis(['MGET', ...list.map((m) => 'nt:' + m.id)]) : Promise.resolve([]),
         C.redis(['MGET', ...list.map((m) => 'ml:' + m.id)]),
+        useSticky ? C.redis(['GET', 'lastok']) : Promise.resolve(null),
+        C.redis(['MGET', ...pids.map((p) => 'pcd:' + p)]),
       ]);
     } catch (_) {}
     // sehat & tidak cooldown dulu; model yg diketahui tak mendukung tools diturunkan saat request memakai tools
-    const tier = (m, i) => (health[m.id] && health[m.id].ok === false ? 4 : 0) + (nt[i] ? 2 : 0) + (cd[i] ? 1 : 0);
+    const pbad = new Set(pids.filter((p, i) => pcdv[i]));   // provider yang barusan banyak gagal
+    const tier = (m, i) => (health[m.id] && health[m.id].ok === false ? 4 : 0) + (nt[i] ? 2 : 0) + (cd[i] ? 1 : 0) + (pbad.has(m.provider) ? 1 : 0);
     const ranked = list.map((m, i) => ({ m, i, t: tier(m, i), s: m.score || 0 })).sort((a, b) => a.t - b.t || b.s - a.s);
     const fit = ranked.filter((x) => !(ml[x.i] && promptTok > Number(ml[x.i])));   // buang model yang sudah terbukti tak muat prompt sebesar ini
-    return (fit.length ? fit : ranked).map((x) => x.m);
+    const out = (fit.length ? fit : ranked).map((x) => x.m);
+    // AUTO "lengket": model yang terakhir berhasil dipakai paling depan, sampai dia gagal
+    const si = lastok ? out.findIndex((m) => m.id === lastok) : -1;
+    if (si >= 0) { stickyId = lastok; if (si > 0) out.unshift(out.splice(si, 1)[0]); }
+    return out;
   };
 
-  if (isAuto(requested)) return { list: await autoList(new Set()), picked: new Set(), mode: 'auto', info: {} };
+  if (isAuto(requested)) { const list = await autoList(new Set(), true); return { list, picked: new Set(), mode: 'auto', info: {}, sticky: stickyId }; }
 
   const r2 = stripNum(requested);
   const all = findPicked(requested, models, true);
@@ -211,7 +220,7 @@ async function chat(req, res, key, st) {
 
   const [providers, models, settings] = await Promise.all([C.loadProviders(), C.loadModels(), C.getSettings().catch(() => C.DEFAULT_SETTINGS)]);
   const fallback = settings.selectFallback === true;
-  const { list: cands, picked, mode, info } = await buildCandidates(requested, providers, models, hasTools, fallback, C.est(reqChars));
+  const { list: cands, picked, mode, info, sticky } = await buildCandidates(requested, providers, models, hasTools, fallback, C.est(reqChars));
   if (!cands.length) {
     if (mode === 'select') {
       let msg;
@@ -242,7 +251,20 @@ async function chat(req, res, key, st) {
     C.redis(['SET', 'ml:' + m.id, String(L), 'EX', 6 * 3600]).catch(() => {});
   };
   const fixOf = (pid) => fixes[pid] || (fixes[pid] = { strip: new Set(), caps: {}, rename: {} });
-  const cd = (id, sec) => C.redis(['SET', 'cd:' + id, '1', 'EX', sec]).catch(() => {});
+  const pfail = {};   // provider -> jumlah model yang gagal "lunak" (5xx/timeout/jaringan/kosong) di request ini
+  const cd = (id, sec) => {
+    const pid = id.split('/')[0];
+    if (sec < 100) {   // kegagalan lunak (bukan 404 / izin model)
+      pfail[pid] = (pfail[pid] || 0) + 1;
+      if (pfail[pid] >= 2) C.redis(['SET', 'pcd:' + pid, '1', 'EX', 90]).catch(() => {});
+    }
+    if (sticky && id === sticky) C.redis(['DEL', 'lastok']).catch(() => {});   // model lengket gagal -> lupakan, cari yang respon
+    return C.redis(['INCR', 'cf:' + id]).then((n) => {
+      C.redis(['EXPIRE', 'cf:' + id, 1800]).catch(() => {});
+      const s2 = Math.min(1200, sec * 2 ** Math.min(5, (Number(n) || 1) - 1));   // 45s, 90s, 3m, 6m ... maks 20 mnt
+      return C.redis(['SET', 'cd:' + id, '1', 'EX', s2]);
+    }).catch(() => {});
+  };
 
   for (let pass = 0; pass < 2; pass++) {
   let list2 = cands;
@@ -257,6 +279,7 @@ async function chat(req, res, key, st) {
     if (Date.now() - t0 > BUDGET_MS) break;
     const prov = providers[m.provider];
     if (!prov) continue;
+    if ((pfail[m.provider] || 0) >= 2 && !picked.has(m.id)) continue;   // provider ini sudah 2 model gagal di request ini -> langsung ke provider lain
     // rotasi semua key yang masih aktif untuk provider ini (akun 1 habis -> akun 2, dst)
     // akun yang paling lama tidak dipakai maju duluan -> beban merata ke semua akun, jarang kena limit
     let keys = C.usableKeys(prov).sort((a, b) => (a.lastUsedAt || 0) - (b.lastUsedAt || 0));
@@ -332,7 +355,8 @@ async function chat(req, res, key, st) {
         res.setHeader('x-gateway-attempts', String(attempts));
         res.setHeader('x-gateway-mode', mode);
       };
-      const rec = (tok) => C.record({ key, provider: m.provider, provKeyId: pk.id, model: m.id, tok, ok: true, ms: Date.now() - t0, requested, status: 200, fails, rl });
+      const stick = () => Promise.all([mode === 'auto' ? C.redis(['SET', 'lastok', m.id, 'EX', 86400]) : null, C.redis(['DEL', 'cf:' + m.id, 'cd:' + m.id])].filter(Boolean)).catch(() => {});
+      const rec = (tok) => Promise.all([C.record({ key, provider: m.provider, provKeyId: pk.id, model: m.id, tok, ok: true, ms: Date.now() - t0, requested, status: 200, fails, rl }), stick()]);
 
       if (!stream) {
         let j;
