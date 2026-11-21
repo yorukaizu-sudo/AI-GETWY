@@ -4,7 +4,7 @@ const C = require('../lib/core');
 const ATTEMPT_MS = 25000;   // batas per percobaan untuk model biasa (auto)
 const PICKED_MS = 50000;    // model yang DIPILIH MANUAL lebih sabar (model reasoning/ultra sering lambat)
 const BUDGET_MS = 52000;    // total waktu 1 request (Vercel maxDuration 60s)
-const MAX_ATTEMPTS = 14;
+const MAX_ATTEMPTS = 40;   // cukup untuk memutar belasan akun + beberapa model
 // Mode: model "auto" = pilih model terbaik + fallback. Model spesifik = MODE SELECT (strict: tidak pindah model,
 // kecuali "fallback model pilihan" dinyalakan di dashboard -> Model Atlas, atau env FALLBACK_SPECIFIC=1).
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -229,7 +229,8 @@ async function chat(req, res, key, st) {
     const prov = providers[m.provider];
     if (!prov) continue;
     // rotasi semua key yang masih aktif untuk provider ini (akun 1 habis -> akun 2, dst)
-    let keys = C.usableKeys(prov);
+    // akun yang paling lama tidak dipakai maju duluan -> beban merata ke semua akun, jarang kena limit
+    let keys = C.usableKeys(prov).sort((a, b) => (a.lastUsedAt || 0) - (b.lastUsedAt || 0));
     if (picked.has(m.id)) {   // model pilihan: akun cooldown dicoba juga (yang paling cepat pulih dulu)
       const cool = (prov.keys || []).filter((k) => k.key && C.keyStatus(k) === 'cooldown').sort((a, b) => (a.cooldownUntil || 0) - (b.cooldownUntil || 0));
       keys = keys.concat(cool);
@@ -239,6 +240,7 @@ async function chat(req, res, key, st) {
       keys = (prov.keys || []).filter((k) => k.key && k.enabled !== false && !(k.expiresAt && Date.now() > k.expiresAt)).slice(0, 1);
       if (!keys.length) { fails.push({ model: m.id, error: 'semua API key provider habis/expired' }); continue; }
     }
+    let badReq = 0;
     for (let ki = 0; ki < keys.length; ki++) {
       const pk = keys[ki];
       if (attempts >= MAX_ATTEMPTS || Date.now() - t0 > BUDGET_MS) break outer;
@@ -253,8 +255,8 @@ async function chat(req, res, key, st) {
         const msg = e.name === 'AbortError' ? 'timeout' : String(e.message).slice(0, 120);
         fails.push({ model: m.id, key: pk.label, error: msg });
         cd(m.id, 45);
-        if (e.name !== 'AbortError' && picked.has(m.id) && !retried[m.id + pk.id]) { retried[m.id + pk.id] = 1; await sleep(800); ki--; continue; } // select: 1x coba ulang
-        break; // jaringan/timeout: pindah model, key belum tentu salah
+        if (e.name !== 'AbortError' && picked.has(m.id) && keys.length === 1 && !retried[m.id + pk.id]) { retried[m.id + pk.id] = 1; await sleep(800); ki--; continue; } // select: 1x coba ulang
+        if (e.name === 'AbortError' && !picked.has(m.id)) break; continue; // auto: timeout -> model lain. select/jaringan: coba akun berikutnya
       }
       const { r: ur, done } = up;
 
@@ -279,12 +281,15 @@ async function chat(req, res, key, st) {
           if (code !== 413 && healTries < 4 && heal(body, fixOf(prov.id), txt)) { healTries++; ki--; continue; }
           // model tidak mendukung tools -> ingat 6 jam, turunkan prioritasnya utk request bertools (TIDAK mematikan model)
           if (hasTools && TOOL_RE.test(txt)) C.redis(['SET', 'nt:' + m.id, '1', 'EX', 6 * 3600]).catch(() => {});
-          break; // salah parameter bukan salah model: tanpa cooldown, lanjut model berikutnya
+          if (code === 413) continue;   // batas ukuran/TPM beda tiap akun (org/tier) -> coba akun lain dulu
+          if (++badReq >= 2) break;     // 400/422 sama di 2 akun = memang request-nya yang ditolak, bukan salah akun
+          continue;
         }
         // 404 / 5xx / lainnya: cooldown sementara saja. (Dulu 404 MEMATIKAN model permanen — itu sebabnya model bisa "hilang".)
-        if (code >= 500 && picked.has(m.id) && !retried[m.id + pk.id]) { retried[m.id + pk.id] = 1; await sleep(800); ki--; continue; } // select: 1x coba ulang
+        if (code >= 500 && picked.has(m.id) && keys.length === 1 && !retried[m.id + pk.id]) { retried[m.id + pk.id] = 1; await sleep(800); ki--; continue; } // select: 1x coba ulang
         cd(m.id, code === 404 ? 600 : 45);
-        break;
+        if (code === 404) break;     // model tidak ada: semua akun sama -> pindah model
+        continue;                     // 5xx / lainnya: coba akun berikutnya
       }
 
       /* ---------- sukses ---------- */
@@ -302,12 +307,12 @@ async function chat(req, res, key, st) {
         let j;
         try { j = JSON.parse(await ur.text()); } catch (e) {
           done(); fails.push({ model: m.id, key: pk.label, error: e.name === 'AbortError' ? 'timeout' : 'respons bukan JSON' }); cd(m.id, 45);
-          break;
+          continue; // akun berikutnya
         }
         done();
         if (!j || !Array.isArray(j.choices) || !j.choices.length) {
           fails.push({ model: m.id, key: pk.label, status: 200, error: j && j.error ? JSON.stringify(j.error).slice(0, 200) : 'choices kosong' }); cd(m.id, 45);
-          break;
+          continue; // akun berikutnya
         }
         await C.markKeyGood(prov.id, pk.id);
         okHeaders();
@@ -323,14 +328,14 @@ async function chat(req, res, key, st) {
       let first;
       try { first = await reader.read(); } catch (e) {
         done(); fails.push({ model: m.id, key: pk.label, error: e.name === 'AbortError' ? 'timeout (stream)' : String(e.message).slice(0, 100) }); cd(m.id, 45);
-        break;
+        continue; // akun berikutnya
       }
       done();
       const firstTxt = first.value ? dec.decode(first.value, { stream: true }) : '';
       if (first.done || !firstTxt || /^\s*(data:\s*)?\{\s*"error"/.test(firstTxt)) {
         fails.push({ model: m.id, key: pk.label, status: 200, error: first.done || !firstTxt ? 'stream kosong' : firstTxt.slice(0, 200) }); cd(m.id, 45);
         try { await reader.cancel(); } catch (_) {}
-        break;
+        continue; // akun berikutnya
       }
       await C.markKeyGood(prov.id, pk.id);
       res.status(200);
