@@ -1,0 +1,6 @@
+{
+  "framework": null,
+  "outputDirectory": "public",
+  "functions": { "api/v1.js": { "maxDuration": 60 } },
+  "rewrites": [{ "source": "/v1/:path*", "destination": "/api/v1?path=:path*" }]
+}
